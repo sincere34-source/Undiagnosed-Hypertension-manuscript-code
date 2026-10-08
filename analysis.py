@@ -224,8 +224,7 @@ numeric=Pipeline([("impute",SimpleImputer(strategy="median")),("scale",StandardS
 categorical=Pipeline([("impute",SimpleImputer(strategy="most_frequent")),("encode",OneHotEncoder(handle_unknown="ignore",drop="first"))])
 prep=ColumnTransformer([("num",numeric,NUM),("cat",categorical,CAT)])
 def pipe(clf,smote=False):
-    # Class imbalance is handled by class weighting (and threshold tuning), NOT oversampling.
-    # 'smote' retained only for signature compatibility; SMOTE is never applied.
+    # Class imbalance handled by class weighting (+ threshold tuning), NOT oversampling.
     return SkPipeline([("prep",prep),("clf",clf)])
 def best_threshold(yv,prob):
     p,r,t=precision_recall_curve(yv,prob); f1=2*p*r/(p+r+1e-12); return float(t[np.argmax(f1[:-1])]) if len(t) else 0.5
@@ -395,12 +394,9 @@ print(f"Complete-case sensitivity: n={len(cc)}, Gradient Boosting test AUC-ROC={
 # ------------------------------------------------------------------
 
 # ============================================================================
-# ADDITIONAL MANUSCRIPT ANALYSES
-# (reduced logistic models + calibration; survey-weighted adjusted odds ratios;
-#  survey-weighted Table 1 by outcome). Added for the journal revision.
+# ADDITIONAL MANUSCRIPT ANALYSES (journal revision)
+# reduced models + calibration; survey-weighted adjusted ORs; weighted Table 1
 # ============================================================================
-
-# --- Reduced logistic models (age-only, age+BMI, full) on the same 80/20 split ---
 def _lr_auc(cols):
     num=[c for c in cols if c in NUM]; cat=[c for c in cols if c in CAT]
     tr=[("num",Pipeline([("i",SimpleImputer(strategy="median")),("s",StandardScaler())]),num)]
@@ -410,16 +406,35 @@ def _lr_auc(cols):
                    ("c",LogisticRegression(C=0.01,penalty="l2",solver="liblinear",
                                            class_weight="balanced",max_iter=4000,random_state=RANDOM_STATE))])
     pl.fit(Xtr[cols],ytr); return roc_auc_score(yte,pl.predict_proba(Xte[cols])[:,1])
+def _lr_prob(cols):
+    num=[c for c in cols if c in NUM]; cat=[c for c in cols if c in CAT]
+    tr=[("num",Pipeline([("i",SimpleImputer(strategy="median")),("s",StandardScaler())]),num)]
+    if cat: tr.append(("cat",Pipeline([("i",SimpleImputer(strategy="most_frequent")),
+                                       ("e",OneHotEncoder(handle_unknown="ignore",drop="first"))]),cat))
+    pl=SkPipeline([("p",ColumnTransformer(tr)),
+                   ("c",LogisticRegression(C=0.01,penalty="l2",solver="liblinear",
+                                           class_weight="balanced",max_iter=4000,random_state=RANDOM_STATE))])
+    pl.fit(Xtr[cols],ytr); return pl.predict_proba(Xte[cols])[:,1]
+def _auc_ci(prob,seed=RANDOM_STATE,n=1000):
+    yv=np.asarray(yte); auc=roc_auc_score(yv,prob); rng=np.random.default_rng(seed); a=[]
+    for _ in range(n):
+        i=rng.integers(0,len(yv),len(yv))
+        if len(np.unique(yv[i]))<2: continue
+        a.append(roc_auc_score(yv[i],prob[i]))
+    return round(auc,3),round(np.percentile(a,2.5),3),round(np.percentile(a,97.5),3)
+# Table 5: reduced and benchmark logistic models (community-feasible = interview + scale + tape measure)
+_reduced={"Age only":["age"],"Age + BMI":["age","bmi"],
+ "Community-feasible":["age","sex","bmi","waist_cm","alcohol_use","tobacco_use","phys_activity_level"],
+ "Full logistic model":NUM+CAT}
+_rr=[]
+for _rn,_rc in _reduced.items():
+    _rc=[x for x in _rc if x in (NUM+CAT)]; _a,_lo,_hi=_auc_ci(_lr_prob(_rc))
+    _rr.append({"Model":_rn,"AUC_ROC":_a,"CI_low":_lo,"CI_high":_hi})
+t_red=pd.DataFrame(_rr)
+print("Table 5. Reduced and benchmark logistic regression models (AUC-ROC with 95% CI)")
+display(t_red); savecsv(t_red,"table_5_reduced_models.csv")
 
-t_red=pd.DataFrame([
-    {"Model":"Age only","AUC_ROC":round(_lr_auc(["age"]),3)},
-    {"Model":"Age + BMI","AUC_ROC":round(_lr_auc(["age","bmi"]),3)},
-    {"Model":"Full logistic model","AUC_ROC":round(_lr_auc(NUM+CAT),3)}])
-print("Reduced logistic models (AUC-ROC)"); display(t_red); savecsv(t_red,"table_reduced_models.csv")
-
-# Calibration of the full (class-weighted) logistic model: intercept and slope
-_prep_full=ColumnTransformer([
-    ("num",Pipeline([("i",SimpleImputer(strategy="median")),("s",StandardScaler())]),NUM),
+_prep_full=ColumnTransformer([("num",Pipeline([("i",SimpleImputer(strategy="median")),("s",StandardScaler())]),NUM),
     ("cat",Pipeline([("i",SimpleImputer(strategy="most_frequent")),
                      ("e",OneHotEncoder(handle_unknown="ignore",drop="first"))]),CAT)])
 _lrf=SkPipeline([("p",_prep_full),("c",LogisticRegression(C=0.01,penalty="l2",solver="liblinear",
@@ -428,36 +443,94 @@ _ph=np.clip(_lrf.predict_proba(Xte)[:,1],1e-6,1-1e-6); _logit=np.log(_ph/(1-_ph)
 _cal=sm.Logit(np.asarray(yte),sm.add_constant(_logit)).fit(disp=0)
 print(f"Calibration (full logistic model): intercept={_cal.params[0]:.3f}, slope={_cal.params[1]:.3f}")
 
-# --- Survey-weighted multivariable logistic regression: adjusted odds ratios ---
 _cont=[c for c in ["age","bmi","waist_cm","heart_rate","fasting_glucose_mmol","total_chol_mmol"] if c in data.columns]
 _catv=[c for c in ["sex","residence","alcohol_use","tobacco_use","phys_activity_level","diabetes"] if c in data.columns]
 _dw=data[data["survey_weight"].notna()].dropna(subset=_cont+_catv+["undiagnosed_htn"]).copy()
-_rhs=" + ".join(_cont+[f"C({c})" for c in _catv])
-_glm=smf.glm("undiagnosed_htn ~ "+_rhs, data=_dw, family=sm.families.Binomial(),
-             var_weights=_dw["survey_weight"]).fit(cov_type="cluster", cov_kwds={"groups":_dw["psu"]})
+_glm=smf.glm("undiagnosed_htn ~ "+" + ".join(_cont+[f"C({c})" for c in _catv]),data=_dw,
+             family=sm.families.Binomial(),var_weights=_dw["survey_weight"]).fit(cov_type="cluster",cov_kwds={"groups":_dw["psu"]})
 _or=np.exp(_glm.params); _ci=np.exp(_glm.conf_int())
-aor_rows=[]
-for k in _glm.params.index:
-    if k=="Intercept": continue
-    aor_rows.append({"Predictor":k,"aOR":round(_or[k],2),
-                     "CI_low":round(_ci.loc[k,0],2),"CI_high":round(_ci.loc[k,1],2),
-                     "p_value":round(_glm.pvalues[k],3)})
-t_aor=pd.DataFrame(aor_rows)
-print("Survey-weighted adjusted odds ratios (cluster-robust by PSU)"); display(t_aor); savecsv(t_aor,"table_adjusted_or.csv")
+t_aor=pd.DataFrame([{"Predictor":k,"aOR":round(_or[k],2),"CI_low":round(_ci.loc[k,0],2),
+                     "CI_high":round(_ci.loc[k,1],2),"p_value":round(_glm.pvalues[k],3)}
+                    for k in _glm.params.index if k!="Intercept"])
+print("Survey-weighted adjusted odds ratios"); display(t_aor); savecsv(t_aor,"table_adjusted_or.csv")
 
-# --- Survey-weighted Table 1 by undiagnosed-hypertension status ---
 _w=data["survey_weight"]
 def _wmsd(col,mask):
     x=pd.to_numeric(data.loc[mask,col],errors="coerce"); ww=_w[mask]; v=x.notna(); x,ww=x[v],ww[v]
     mu=np.average(x,weights=ww); return mu,np.sqrt(np.average((x-mu)**2,weights=ww))
-def _wpct(col,val,mask):
-    x=data.loc[mask,col].astype(str); ww=_w[mask]; v=x.notna()
-    return 100*ww[v][x[v]==str(val)].sum()/ww[v].sum()
 _all=data["undiagnosed_htn"].notna(); _yes=data["undiagnosed_htn"]==1; _no=data["undiagnosed_htn"]==0
-t1_rows=[]
-for c in _cont:
-    t1_rows.append({"Variable":c,
-        "Overall":"%.1f (%.1f)"%_wmsd(c,_all),"Undiagnosed":"%.1f (%.1f)"%_wmsd(c,_yes),"Not undiagnosed":"%.1f (%.1f)"%_wmsd(c,_no)})
-t1w=pd.DataFrame(t1_rows)
-print("Survey-weighted Table 1 (continuous, mean (SD))"); display(t1w); savecsv(t1w,"table_1_weighted.csv")
-print(f"Weighted undiagnosed prevalence: {100*_w[_yes].sum()/_w[_all].sum():.1f}% | n overall/yes/no = {int(_all.sum())}/{int(_yes.sum())}/{int(_no.sum())}")
+def _wpct(col,val,mask):
+    x=data.loc[mask,col].astype(str); ww=_w[mask]; v=x.notna(); return 100*ww[v][x[v]==str(val)].sum()/ww[v].sum()
+_t1_cont=[("Age, years","age"),("BMI, kg/m\u00b2","bmi"),("Waist circumference, cm","waist_cm"),
+          ("Resting heart rate, bpm","heart_rate"),("Fasting glucose, mmol/L","fasting_glucose_mmol"),
+          ("Total cholesterol, mmol/L","total_chol_mmol")]
+_t1_cat=[("Male, %","sex","Male"),("Urban residence, %","residence","Urban"),("Current alcohol use, %","alcohol_use","Yes"),
+         ("Current tobacco use, %","tobacco_use","Yes"),("Diagnosed diabetes, %","diabetes","Yes"),
+         ("Low physical activity, %","phys_activity_level","Low")]
+_t1=[]
+for _lab,_c in _t1_cont:
+    _t1.append({"Characteristic":_lab,"Overall":"%.1f (%.1f)"%_wmsd(_c,_all),
+                "Undiagnosed":"%.1f (%.1f)"%_wmsd(_c,_yes),"Not undiagnosed":"%.1f (%.1f)"%_wmsd(_c,_no)})
+for _lab,_c,_v in _t1_cat:
+    _t1.append({"Characteristic":_lab,"Overall":"%.1f"%_wpct(_c,_v,_all),
+                "Undiagnosed":"%.1f"%_wpct(_c,_v,_yes),"Not undiagnosed":"%.1f"%_wpct(_c,_v,_no)})
+t1w=pd.DataFrame(_t1)
+print("Table 1. Characteristics overall and by undiagnosed-hypertension status (survey-weighted; continuous mean (SD), categorical %)")
+display(t1w); savecsv(t1w,"table_1_weighted.csv")
+print(f"n={int(_all.sum())} ({int(_yes.sum())} undiagnosed, {int(_no.sum())} not); weighted undiagnosed prevalence {100*_w[_yes].sum()/_w[_all].sum():.1f}%")
+
+# ============================================================================
+# BENCHMARK, CALIBRATION AND SENSITIVITY ANALYSES (journal revision)
+# ============================================================================
+t_cal=pd.DataFrame([{"Model":_n,"Calib_intercept":round(sm.Logit(np.asarray(yte),
+        sm.add_constant(np.log(np.clip(_p,1e-6,1-1e-6)/(1-np.clip(_p,1e-6,1-1e-6))))).fit(disp=0).params[0],3),
+    "Calib_slope":round(sm.Logit(np.asarray(yte),
+        sm.add_constant(np.log(np.clip(_p,1e-6,1-1e-6)/(1-np.clip(_p,1e-6,1-1e-6))))).fit(disp=0).params[1],3)}
+    for _n,_p in probs.items()])
+print("Per-model calibration (test set)"); display(t_cal); savecsv(t_cal,"table_calibration.csv")
+
+# Community-feasible model is reported in Table 5 (reduced-models block above).
+
+def _net_benefit(y,p,pt):
+    y=np.asarray(y); pred=p>=pt; tp=np.sum(pred&(y==1)); fp=np.sum(pred&(y==0)); n=len(y)
+    return tp/n-(fp/n)*(pt/(1-pt))
+_prev=np.mean(yte); _better=[]
+for _pt in np.linspace(0.05,0.40,36):
+    _nb_all=_prev-(1-_prev)*(_pt/(1-_pt))
+    if (_net_benefit(yte,probs["Logistic Regression"],_pt)>max(_nb_all,0.0)
+        and _net_benefit(yte,probs["Gradient Boosting"],_pt)>max(_nb_all,0.0)): _better.append(_pt)
+if _better: print(f"Decision curve analysis: LR and GB exceed treat-all/treat-none net benefit over p~{min(_better):.2f}-{max(_better):.2f}")
+
+_raw=pd.read_stata(DATA_FILE, convert_categoricals=False)
+_prevdiag=(_raw["h2a"]==1).reindex(data.index).fillna(False).values
+_nt=data[~_prevdiag].copy(); _Xn=_nt[NUM+CAT]; _yn=_nt["undiagnosed_htn"].astype(int)
+_Xtr2,_Xte2,_ytr2,_yte2=train_test_split(_Xn,_yn,test_size=0.20,stratify=_yn,random_state=RANDOM_STATE)
+_yte2=np.asarray(_yte2); _aucs={}; _pr2={}
+for _name,_pl in models.items():
+    _pl.fit(_Xtr2,_ytr2); _pp=_pl.predict_proba(_Xte2)[:,1]; _pr2[_name]=_pp; _aucs[_name]=roc_auc_score(_yte2,_pp)
+_a1,_a2,_z,_pv=delong_test(_yte2,_pr2["Gradient Boosting"],_pr2["Logistic Regression"])
+print(f"Never-told sensitivity: n={len(_nt)}, measured-high={100*_yn.mean():.1f}%, "
+      f"AUC range {min(_aucs.values()):.3f}-{max(_aucs.values()):.3f}, GB vs LR DeLong p={_pv:.3f}")
+
+# ============================================================================
+# DESIGN-BASED BIVARIATE ASSOCIATIONS (survey weights + clustering; Rao-Scott
+# style design adjustment) ,  reported in the manuscript "Factors associated"
+# ============================================================================
+_db=data[data["survey_weight"].notna()].copy()
+def _design_pval(pred):
+    sub=_db.dropna(subset=[pred,"undiagnosed_htn","survey_weight","psu"]).copy()
+    try:
+        if pred in CAT:
+            sub[pred]=sub[pred].astype(str)
+            m=smf.glm(f"undiagnosed_htn ~ C({pred})",data=sub,family=sm.families.Binomial(),
+                      var_weights=sub["survey_weight"]).fit(cov_type="cluster",cov_kwds={"groups":sub["psu"]})
+            idx=[list(m.params.index).index(t) for t in m.params.index if t!="Intercept"]
+            return float(m.wald_test(np.eye(len(m.params))[idx],scalar=True).pvalue)
+        m=smf.glm(f"undiagnosed_htn ~ {pred}",data=sub,family=sm.families.Binomial(),
+                  var_weights=sub["survey_weight"]).fit(cov_type="cluster",cov_kwds={"groups":sub["psu"]})
+        return float(m.pvalues[pred])
+    except Exception:
+        return float("nan")
+_biv=pd.DataFrame([{"Predictor":p,"design_p":round(_design_pval(p),4),
+                    "significant":"Yes" if _design_pval(p)<0.05 else "No"} for p in NUM+CAT])
+print("Design-based bivariate associations (survey-weighted, cluster-robust)"); display(_biv); savecsv(_biv,"table_bivariate_design.csv")
